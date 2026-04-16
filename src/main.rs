@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use droppable_process::prelude::*;
 use ratatui::crossterm;
 use ratatui::layout::Spacing;
@@ -11,14 +11,55 @@ use std::ffi::OsStr;
 use std::io::Read;
 use std::thread::JoinHandle;
 use tinyvec::ArrayVec;
+use std::fmt::Display;
 
 const BUFFER_SIZE: usize = 4096;
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum OverallLayout {
+    Horizontal,
+    #[default]
+    Vertical,
+}
+
+impl Display for OverallLayout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", match self {
+            OverallLayout::Horizontal => "horizontal",
+            OverallLayout::Vertical => "vertical",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum SplitLayout {
+    // Combined,
+    #[default]
+    Horizontal,
+    Vertical,
+}
+impl Display for SplitLayout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", match self {
+            SplitLayout::Horizontal => "horizontal",
+            SplitLayout::Vertical => "vertical",
+        })
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command()]
 struct Args {
     #[arg(long, short)]
     commands: Vec<Box<OsStr>>,
+
+    #[arg(long, default_value_t=OverallLayout::Vertical)]
+    /// Layout between commands
+    overall_layout: OverallLayout,
+
+    #[arg(long, default_value_t=SplitLayout::Horizontal)]
+    /// Layout between the stdout and stderr of a command
+    split_layout: SplitLayout,
 
     #[arg(long, short = 'r')]
     /// The height of what is rendered.
@@ -49,10 +90,11 @@ struct Process<'a> {
     title: Span<'a>,
     thread: std::thread::JoinHandle<()>,
     parser_pair: OnceCell<ParserPair>,
+    layout: SplitLayout,
 }
 
 impl<'a> Process<'a> {
-    fn new(title: Cow<'a, str>, thread: JoinHandle<()>) -> Self {
+    fn new(title: Cow<'a, str>, thread: JoinHandle<()>, layout: SplitLayout) -> Self {
         Self {
             title: Span {
                 style: Style::new(),
@@ -60,6 +102,7 @@ impl<'a> Process<'a> {
             },
             thread,
             parser_pair: OnceCell::new(),
+            layout,
         }
     }
 
@@ -84,10 +127,15 @@ impl Widget for &mut Process<'_> {
     where
         Self: Sized,
     {
-        let [left_area, right_area] =
-            Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1)])
-                .spacing(Spacing::Overlap(1))
-                .areas(area);
+        let [left_area, right_area] = Layout::new(
+            match self.layout {
+                SplitLayout::Horizontal => Direction::Horizontal,
+                SplitLayout::Vertical => Direction::Vertical,
+            },
+            [Constraint::Fill(1), Constraint::Fill(1)],
+        )
+        .spacing(Spacing::Overlap(1))
+        .areas(area);
         let left_block = Block::bordered()
             .title(vec!["stdout ".into(), self.title.clone()])
             .merge_borders(MergeStrategy::Exact);
@@ -225,7 +273,7 @@ fn main() {
             process.0.wait().unwrap();
         });
 
-        processes.push(Process::new(title.into(), thread));
+        processes.push(Process::new(title.into(), thread, args.split_layout));
     }
     drop(tx);
 
@@ -236,9 +284,14 @@ fn main() {
             ratatui_terminal
                 .draw(|frame| {
                     let area = frame.area();
-                    let areas =
-                        Layout::vertical(std::iter::repeat_n(Constraint::Fill(1), processes.len()))
-                            .split(area);
+                    let areas = Layout::new(
+                        match args.overall_layout {
+                            OverallLayout::Horizontal => Direction::Horizontal,
+                            OverallLayout::Vertical => Direction::Vertical,
+                        },
+                        std::iter::repeat_n(Constraint::Fill(1), processes.len()),
+                    )
+                    .split(area);
                     for i in 0..processes.len() {
                         frame.render_widget(&mut processes[i], areas[i]);
                     }
