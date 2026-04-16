@@ -1,193 +1,30 @@
 use clap::Parser;
-use crossterm::{cursor, execute, queue};
 use droppable_process::prelude::*;
+use ratatui::crossterm;
+use ratatui::layout::Spacing;
+use ratatui::prelude::*;
+use ratatui::symbols::merge::MergeStrategy;
+use ratatui::widgets::Block;
+use std::borrow::Cow;
+use std::cell::OnceCell;
 use std::ffi::OsStr;
-use std::io::{Read, StdoutLock, Write};
-use std::sync::{Arc, Mutex};
+use std::io::Read;
+use std::thread::JoinHandle;
 use tinyvec::ArrayVec;
-use unicode_width::UnicodeWidthChar;
 
 const BUFFER_SIZE: usize = 4096;
-
-fn stdout_title(s: impl std::fmt::Display) -> Box<str> {
-    format!("OUT: {s}").into()
-}
-
-fn stderr_title(s: impl std::fmt::Display) -> Box<str> {
-    format!("ERR: {s}").into()
-}
 
 #[derive(Parser, Debug)]
 #[command()]
 struct Args {
     #[arg(long, short)]
-    commands: Vec<Arc<OsStr>>,
+    commands: Vec<Box<OsStr>>,
 
     #[arg(long, short = 'r')]
-    max_height: Option<u16>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RenderType {
-    Content,
-    Everything,
-    EverythingExceptContent,
-}
-
-impl RenderType {
-    fn should_draw_titles(&self) -> bool {
-        match self {
-            RenderType::Content => false,
-            RenderType::Everything => true,
-            RenderType::EverythingExceptContent => true,
-        }
-    }
-    fn should_draw_borders(&self) -> bool {
-        match self {
-            RenderType::Content => false,
-            RenderType::Everything => true,
-            RenderType::EverythingExceptContent => true,
-        }
-    }
-    fn should_draw_content(&self) -> bool {
-        match self {
-            RenderType::Content => true,
-            RenderType::Everything => true,
-            RenderType::EverythingExceptContent => false,
-        }
-    }
-}
-
-struct TerminalManager<'a> {
-    stdout: StdoutLock<'a>,
-    titles: Arc<Mutex<Vec<Box<str>>>>,
-    size_info: SizeInfo,
-    pane_count: usize,
-}
-
-impl<'a> TerminalManager<'a> {
-    fn new(
-        mut stdout: StdoutLock<'a>,
-        titles: Arc<Mutex<Vec<Box<str>>>>,
-        size_info: SizeInfo,
-        pane_count: usize,
-    ) -> Self {
-        queue!(
-            stdout,
-            crossterm::cursor::SavePosition,
-            crossterm::cursor::Hide,
-        )
-        .unwrap();
-
-        crossterm::terminal::enable_raw_mode().unwrap();
-        Self {
-            stdout,
-            titles,
-            size_info,
-            pane_count, // title,
-                        // lines: Vec::with_capacity(inner_height.into()),
-        }
-    }
-
-    fn render(&mut self, parser_pairs: &[ParserPair], render_type: RenderType) {
-        if render_type.should_draw_titles() {
-            queue!(self.stdout, crossterm::cursor::RestorePosition).unwrap();
-            let mut to_write = String::with_capacity(self.size_info.terminal_columns as usize);
-            to_write.push('╭');
-            let titles = self.titles.lock().unwrap();
-            for (index, title) in titles.iter().enumerate() {
-                let mut remaining_straight_lines_to_print =
-                    self.size_info.pane_inner_columns as usize;
-                for ch in title.chars() {
-                    let ch_width = ch.width().unwrap();
-                    if ch_width > remaining_straight_lines_to_print {
-                        break;
-                    }
-                    to_write.push(ch);
-                    remaining_straight_lines_to_print -= ch_width;
-                }
-                for _ in 0..remaining_straight_lines_to_print {
-                    to_write.push('─');
-                }
-                if index == titles.len() - 1 {
-                    to_write.push('╮');
-                } else {
-                    to_write.push('┬');
-                }
-            }
-            write!(self.stdout, "{}", to_write).unwrap();
-        }
-        if render_type.should_draw_borders() {
-            for _ in 0..self.size_info.pane_inner_rows {
-                write!(self.stdout, "\n").unwrap();
-                queue!(self.stdout, crossterm::cursor::MoveToColumn(0)).unwrap();
-                for _ in 0..self.pane_count + 1 {
-                    write!(self.stdout, "│").unwrap();
-                    queue!(
-                        self.stdout,
-                        crossterm::cursor::MoveRight(self.size_info.pane_inner_columns)
-                    )
-                    .unwrap();
-                }
-            }
-            queue!(self.stdout, crossterm::cursor::MoveToColumn(0),).unwrap();
-            let mut to_write = String::with_capacity(self.size_info.terminal_columns as usize);
-            to_write.push('╰');
-            for i in 0..self.pane_count {
-                for _ in 0..self.size_info.pane_inner_columns {
-                    to_write.push('─');
-                }
-                if i == self.pane_count - 1 {
-                    to_write.push('╯');
-                } else {
-                    to_write.push('┴');
-                }
-            }
-            write!(self.stdout, "\n{}", to_write).unwrap();
-        }
-
-        if render_type.should_draw_content() {
-            for (parser_index, parser) in parser_pairs
-                .iter()
-                .flat_map(ParserPair::as_array)
-                .enumerate()
-            {
-                for (row_index, row) in parser
-                    .screen()
-                    .rows_formatted(0, self.size_info.pane_inner_columns)
-                    .enumerate()
-                {
-                    queue!(
-                        self.stdout,
-                        crossterm::cursor::RestorePosition,
-                        crossterm::cursor::MoveUp(
-                            self.size_info.pane_inner_rows - row_index as u16
-                        ),
-                        crossterm::cursor::MoveRight(
-                            1 + parser_index as u16 * (self.size_info.pane_inner_columns + 1)
-                        )
-                    )
-                    .unwrap();
-                    // write!(self.stdout, "{:?}", row).unwrap();
-                    self.stdout.write_all(&row).unwrap();
-                }
-            }
-            self.stdout.flush().unwrap();
-        }
-    }
-}
-
-impl Drop for TerminalManager<'_> {
-    fn drop(&mut self) {
-        let _ = execute!(
-            self.stdout,
-            cursor::MoveToColumn(0),
-            cursor::MoveDown(self.size_info.terminal_rows)
-        );
-        println!();
-        let _ = crossterm::terminal::disable_raw_mode();
-        let _ = execute!(self.stdout, cursor::Show);
-    }
+    /// The height of what is rendered.
+    /// The height of emulated terminals is rows-2 since a borders are rendered.
+    /// If not provided, your terminal height will be used.
+    rows: Option<u16>,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -208,49 +45,108 @@ struct ParserPair {
     stderr: vt100::Parser,
 }
 
-impl ParserPair {
-    fn new(rows: u16, cols: u16, scrollback_len: usize) -> ParserPair {
-        ParserPair {
-            stdout: vt100::Parser::new(rows, cols, scrollback_len),
-            stderr: vt100::Parser::new(rows, cols, scrollback_len),
+struct Process<'a> {
+    title: Span<'a>,
+    thread: std::thread::JoinHandle<()>,
+    parser_pair: OnceCell<ParserPair>,
+}
+
+impl<'a> Process<'a> {
+    fn new(title: Cow<'a, str>, thread: JoinHandle<()>) -> Self {
+        Self {
+            title: Span {
+                style: Style::new(),
+                content: title,
+            },
+            thread,
+            parser_pair: OnceCell::new(),
         }
     }
 
-    fn get_mut(&mut self, output_channel: OutputChannel) -> &mut vt100::Parser {
-        match output_channel {
-            OutputChannel::Stdout => &mut self.stdout,
-            OutputChannel::Stderr => &mut self.stderr,
+    fn get_mut(&mut self, channel: OutputChannel) -> &mut vt100::Parser {
+        match channel {
+            OutputChannel::Stdout => &mut self.parser_pair.get_mut().unwrap().stdout,
+            OutputChannel::Stderr => &mut self.parser_pair.get_mut().unwrap().stderr,
         }
     }
+}
 
-    fn as_array(&self) -> [&vt100::Parser; 2] {
-        [&self.stdout, &self.stderr]
+fn vt100_color_to_ratatui_color(vt100_color: vt100::Color) -> ratatui::prelude::Color {
+    match vt100_color {
+        vt100::Color::Default => ratatui::prelude::Color::default(),
+        vt100::Color::Idx(i) => ratatui::prelude::Color::Indexed(i),
+        vt100::Color::Rgb(r, g, b) => ratatui::prelude::Color::Rgb(r, g, b),
     }
 }
 
-#[derive(Clone, Copy)]
-struct SizeInfo {
-    terminal_columns: u16,
-    terminal_rows: u16,
-    pane_outer_rows: u16,
-    pane_inner_columns: u16,
-    pane_inner_rows: u16,
-}
-
-fn calculate_size(
-    terminal_columns: u16,
-    terminal_rows: u16,
-    pane_count: u16,
-    max_height: Option<u16>,
-) -> SizeInfo {
-    let terminal_rows = terminal_rows.min(max_height.unwrap_or(u16::MAX));
-    let pane_inner_columns = (terminal_columns - 1) / (pane_count) - 1;
-    SizeInfo {
-        terminal_columns,
-        terminal_rows,
-        pane_outer_rows: terminal_rows,
-        pane_inner_columns,
-        pane_inner_rows: terminal_rows - 2,
+impl Widget for &mut Process<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer)
+    where
+        Self: Sized,
+    {
+        let [left_area, right_area] =
+            Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1)])
+                .spacing(Spacing::Overlap(1))
+                .areas(area);
+        let left_block = Block::bordered()
+            .title(vec!["stdout ".into(), self.title.clone()])
+            .merge_borders(MergeStrategy::Exact);
+        let right_block = Block::bordered()
+            .title(vec!["stderr ".into(), self.title.clone()])
+            .merge_borders(MergeStrategy::Exact);
+        let left_inner_area = left_block.inner(left_area);
+        let right_inner_area = right_block.inner(right_area);
+        left_block.render(left_area, buf);
+        right_block.render(right_area, buf);
+        let _ = self.parser_pair.get_or_init(|| ParserPair {
+            stdout: vt100::Parser::new(left_inner_area.height, left_inner_area.width, 0),
+            stderr: vt100::Parser::new(right_inner_area.height, right_inner_area.width, 0),
+        });
+        let parser_pair = self.parser_pair.get_mut().unwrap();
+        parser_pair
+            .stdout
+            .screen_mut()
+            .set_size(left_inner_area.height, left_inner_area.width);
+        parser_pair
+            .stderr
+            .screen_mut()
+            .set_size(right_inner_area.height, right_inner_area.width);
+        let mut render_parser = |parser: &vt100::Parser, area: Rect| {
+            for y in 0..area.height {
+                for x in 0..area.width {
+                    let parser_cell = parser.screen().cell(y, x).unwrap();
+                    let buffer_cell = buf.cell_mut(Position::new(x + area.x, y + area.y)).unwrap();
+                    if parser_cell.has_contents() {
+                        buffer_cell.set_symbol(parser_cell.contents());
+                    }
+                    let mut modifier = Modifier::default();
+                    if parser_cell.bold() {
+                        modifier |= Modifier::BOLD;
+                    }
+                    if parser_cell.dim() {
+                        modifier |= Modifier::DIM;
+                    }
+                    if parser_cell.italic() {
+                        modifier |= Modifier::ITALIC;
+                    }
+                    if parser_cell.underline() {
+                        modifier |= Modifier::UNDERLINED;
+                    }
+                    if parser_cell.inverse() {
+                        modifier |= Modifier::REVERSED;
+                    }
+                    buffer_cell.set_style(Style {
+                        fg: Some(vt100_color_to_ratatui_color(parser_cell.fgcolor())),
+                        bg: Some(vt100_color_to_ratatui_color(parser_cell.bgcolor())),
+                        underline_color: None,
+                        add_modifier: modifier,
+                        sub_modifier: Modifier::default(),
+                    });
+                }
+            }
+        };
+        render_parser(&parser_pair.stdout, left_inner_area);
+        render_parser(&parser_pair.stderr, right_inner_area);
     }
 }
 
@@ -264,121 +160,113 @@ fn main() {
 
     let (tx, rx) = std::sync::mpsc::channel();
 
-    let (terminal_columns, terminal_rows) = crossterm::terminal::size().unwrap();
+    let mut ratatui_terminal = ratatui::init_with_options(ratatui::TerminalOptions {
+        viewport: ratatui::Viewport::Inline(
+            args.rows
+                .unwrap_or_else(|| crossterm::terminal::size().unwrap().1),
+        ),
+    });
 
-    let pane_count = args.commands.len() * 2;
-
-    let titles: Arc<Mutex<Vec<Box<str>>>> = Arc::new(Mutex::new(
-        args.commands
-            .iter()
-            .flat_map(|command| {
-                let s = command.to_string_lossy();
-                [stdout_title(&s), stderr_title(s)]
-            })
-            .collect(),
-    ));
-
-    let size_info = calculate_size(
-        terminal_columns,
-        terminal_rows,
-        pane_count as u16,
-        args.max_height,
-    );
-
-    let mut terminal_manager = TerminalManager::new(
-        std::io::stdout().lock(),
-        titles.clone(),
-        size_info,
-        pane_count,
-    );
-
-    let mut parsers = Vec::with_capacity(args.commands.len());
-    for _ in 0..args.commands.len() {
-        parsers.push(ParserPair::new(
-            size_info.pane_inner_rows,
-            size_info.pane_inner_columns,
-            0,
-        ));
-    }
-
-    terminal_manager.render(&parsers, RenderType::EverythingExceptContent);
-
-    let threads: Vec<std::thread::JoinHandle<()>> = args
-        .commands
-        .into_iter()
-        .enumerate()
-        .map(|(process_index, command)| {
-            let tx = tx.clone();
-            std::thread::spawn(move || {
-                use std::process::Stdio;
-                let mut process = DroppableProcess(std::process::Command::new("bash")
+    let mut processes = Vec::with_capacity(args.commands.len());
+    for (process_index, command) in args.commands.into_iter().enumerate() {
+        let title = command.to_string_lossy().to_string();
+        let tx = tx.clone();
+        let thread = std::thread::spawn(move || {
+            use std::process::Stdio;
+            let mut process = DroppableProcess(
+                std::process::Command::new("bash")
                     .arg("-c")
                     .arg(command)
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .spawn()
-                    .unwrap());
-                let mut stdout = process.0.stdout.take().unwrap();
-                // let mut buf = Vec::new();
-                // println!("to end: {:?}", stdout.read_to_end(&mut buf));
-                let mut stderr = process.0.stderr.take().unwrap();
+                    .unwrap(),
+            );
+            let mut stdout = process.0.stdout.take().unwrap();
+            let mut stderr = process.0.stderr.take().unwrap();
 
-                macro_rules! spawn_thread {
-                    ($child_channel:ident, $channel_type:expr, $tx:ident) => {
-                        std::thread::spawn(move || {
-                            loop {
-                                // Halved so we can fit as many \r as we need
-                                let mut buffer = [0u8; BUFFER_SIZE / 2];
+            macro_rules! spawn_thread {
+                ($child_channel:ident, $channel_type:expr, $tx:ident) => {
+                    std::thread::spawn(move || {
+                        loop {
+                            // Halved so we can fit as many \r as we need
+                            let mut buffer = [0u8; BUFFER_SIZE / 2];
 
-                                let read_amount = $child_channel.read(&mut buffer).unwrap();
-                                if read_amount == 0 {
-                                    break;
-                                }
-                                let mut message_bytes = ArrayVec::new();
-                                for byte in &buffer[..read_amount] {
-                                    message_bytes.push(*byte);
-                                    if *byte == b'\n' {
-                                        message_bytes.push(b'\r');
-                                    }
-                                }
-                                let msg = Message {
-                                    process_index,
-                                    output_channel: $channel_type,
-                                    bytes: message_bytes,
-                                };
-                                if $tx.send(msg).is_err() {
-                                    break;
-                                };
+                            let read_amount = $child_channel.read(&mut buffer).unwrap();
+                            if read_amount == 0 {
+                                break;
                             }
-                        });
-                    };
-                }
+                            let mut message_bytes = ArrayVec::new();
+                            for byte in &buffer[..read_amount] {
+                                message_bytes.push(*byte);
+                                if *byte == b'\n' {
+                                    message_bytes.push(b'\r');
+                                }
+                            }
+                            let msg = Message {
+                                process_index,
+                                output_channel: $channel_type,
+                                bytes: message_bytes,
+                            };
+                            if $tx.send(msg).is_err() {
+                                break;
+                            };
+                        }
+                    });
+                };
+            }
 
-                let stdout_tx = tx.clone();
-                let stderr_tx = tx;
-                spawn_thread!(stdout, OutputChannel::Stdout, stdout_tx);
-                spawn_thread!(stderr, OutputChannel::Stderr, stderr_tx);
+            let stdout_tx = tx.clone();
+            let stderr_tx = tx;
+            spawn_thread!(stdout, OutputChannel::Stdout, stdout_tx);
+            spawn_thread!(stderr, OutputChannel::Stderr, stderr_tx);
 
-                process.0.wait().unwrap();
-            })
-        })
-        .collect();
+            process.0.wait().unwrap();
+        });
+
+        processes.push(Process::new(title.into(), thread));
+    }
     drop(tx);
 
+    let mut lowest_point = 0;
+
+    macro_rules! render {
+        () => {
+            ratatui_terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    let areas =
+                        Layout::vertical(std::iter::repeat_n(Constraint::Fill(1), processes.len()))
+                            .split(area);
+                    for i in 0..processes.len() {
+                        frame.render_widget(&mut processes[i], areas[i]);
+                    }
+                    lowest_point = lowest_point.max(area.height + area.y);
+                })
+                .unwrap();
+        };
+    }
+
+    // This is done so that the OnceCells can be initialized with layout information
+    let mut is_first = true;
     loop {
+        if is_first {
+            render!();
+            is_first = false;
+        }
+        let mut should_render = false;
         let mut time_to_end = false;
-        let mut render_type = match rx.recv_timeout(std::time::Duration::from_secs(0)) {
+        match rx.recv_timeout(std::time::Duration::from_secs(0)) {
             Ok(message) => {
-                parsers[message.process_index]
+                processes[message.process_index]
                     .get_mut(message.output_channel)
                     .process(&message.bytes);
-                Some(RenderType::Content)
+                should_render = true;
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 time_to_end = true;
-                None
             }
         };
         loop {
@@ -394,33 +282,29 @@ fn main() {
                             time_to_end = true;
                         }
                     }
-                    crossterm::event::Event::Resize(terminal_columns, terminal_rows) => {
-                        render_type = Some(RenderType::Everything);
-                        terminal_manager.size_info = calculate_size(
-                            terminal_columns,
-                            terminal_rows,
-                            pane_count as u16,
-                            args.max_height,
-                        )
-                    }
+                    crossterm::event::Event::Resize(_, _) => should_render = true,
                 }
             } else {
                 break;
             }
         }
-        if let Some(render_type) = render_type {
-            terminal_manager.render(&parsers, render_type);
+        if should_render {
+            render!();
         }
         if time_to_end {
             break;
         }
     }
-    drop(terminal_manager);
-    for thread in threads {
-        if thread.is_finished() {
-            if let Err(err) = thread.join() {
-                eprintln!("Error: {err:?}");
-            }
+    for process in processes {
+        if process.thread.is_finished()
+            && let Err(err) = process.thread.join()
+        {
+            eprintln!("Error: {err:?}");
         }
     }
+    ratatui_terminal
+        .set_cursor_position((0, lowest_point))
+        .unwrap();
+    ratatui::restore();
+    println!();
 }

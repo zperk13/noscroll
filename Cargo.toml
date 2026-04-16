@@ -5,9 +5,8 @@ edition = "2024"
 
 [dependencies]
 clap = {version="4.5.53", features = ["derive"]}
-crossterm = "0.29.0"
+ratatui = "0.30.0"
 ctrlc = "3.5.1"
-unicode-width = "0.2.2"
 droppable_process = {git="https://github.com/zperk13/droppable_process"}
 tinyvec = "1.10.0"
 vt100 = "0.16.2"
