@@ -419,7 +419,7 @@ dependencies = [
 [[package]]
 name = "droppable_process"
 version = "0.1.0"
-source = "git+https://github.com/zperk13/droppable_process#f61c7e5dc77d2f9b2e481e7353c58f49a87170bc"
+source = "git+https://github.com/zperk13/droppable_process#5c5bc1bfb502e45a90859bf3761c5f8f723286cb"
 
 [[package]]
 name = "either"
